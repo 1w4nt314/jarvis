@@ -1,5 +1,11 @@
 """
-JARVIS Action Executor — AppleScript-based system actions.
+JARVIS Action Executor — system actions on macOS and Windows.
+
+macOS drives Terminal.app and the browsers over AppleScript. Windows has no
+AppleScript and needs none: a console window is a `cmd.exe` started with
+its own console, and a browser or editor is its executable started with the
+target as one argv entry — never through a shell, never through
+`os.startfile` for anything that could be a program.
 
 Execute actions IMMEDIATELY, before generating any LLM response.
 Each function returns {"success": bool, "confirmation": str}.
@@ -9,9 +15,38 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import platform_support
 
 log = logging.getLogger("jarvis.actions")
+
+
+def _is_windows() -> bool:
+    # Read at call time, not import time, so a test can stand in for either.
+    return sys.platform == "win32"
+
+
+async def _spawn_detached(argv, *, cwd: str | None = None, **kwargs) -> bool:
+    """Start a GUI program (or a console window) and do not wait for it.
+
+    A browser that was not already running stays alive as long as the user
+    keeps it open, so waiting for it would hang the caller for hours.
+    """
+    def _go() -> bool:
+        subprocess.Popen(argv, cwd=cwd or None, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         **kwargs)
+        return True
+    try:
+        return await asyncio.to_thread(_go)
+    except OSError as e:
+        log.error(f"could not start {argv!r}: {e}")
+        return False
 
 async def _mark_terminal_as_jarvis(revert_after: float = 5.0):
     """Temporarily set the front Terminal window to Ocean theme, then revert.
@@ -80,8 +115,48 @@ def applescript_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", " ")
 
 
-async def open_terminal(command: str = "") -> dict:
-    """Open Terminal.app and optionally run a command. Marks it blue for JARVIS."""
+def _cd_then(cwd: str | None, command: str) -> str:
+    """The POSIX shell text for "in `cwd`, run `command`" — what Terminal.app
+    is asked to `do script`."""
+    if not cwd:
+        return command
+    cd = f"cd {shlex.quote(cwd)}"
+    return f"{cd} && {command}" if command else cd
+
+
+async def _open_console_windows(command: str, cwd: str | None) -> dict:
+    """A new `cmd.exe` console in `cwd`, optionally running `command`.
+
+    The directory is the child's working directory, not text in a command
+    line, so no path ever needs quoting for cmd.exe. `command` has already
+    been through `builds.command_problem` (no shell metacharacters) by the
+    only caller that passes one. `title JARVIS` is this platform's version of
+    the blue Terminal theme: it shows the user which window JARVIS opened.
+    """
+    comspec = os.environ.get("COMSPEC") or "cmd.exe"
+    line = f'"{comspec}" /k title JARVIS'
+    if command:
+        # A project-local launcher (`.venv/Scripts/python.exe`) must be
+        # spelled with backslashes, or cmd.exe reads its `/` as a switch.
+        head, sep, rest = command.partition(" ")
+        line += f" & {head.replace('/', chr(92))}{sep}{rest}"
+    ok = await _spawn_detached(line, cwd=cwd, **platform_support.new_console_flags())
+    return {
+        "success": ok,
+        "confirmation": "A console window is open, sir." if ok
+        else "I had trouble opening a console window, sir.",
+    }
+
+
+async def open_terminal(command: str = "", cwd: str | None = None) -> dict:
+    """Open a terminal window, optionally in `cwd` and running `command`.
+
+    macOS: Terminal.app, marked blue for JARVIS. Windows: a new console
+    window (a Windows Terminal tab where that is the default terminal).
+    """
+    if _is_windows():
+        return await _open_console_windows(command, cwd)
+    command = _cd_then(cwd, command)
     if command:
         escaped = applescript_escape(command)
         script = (
@@ -124,7 +199,14 @@ async def open_browser(url: str, browser: str = "chrome") -> dict:
     The URL arrives from a model, out of speech, possibly echoing a page or a
     README, so this is a straight line from attacker text to a shell.
     `tests/test_applescript_url_injection.py` runs the payload.
+
+    On Windows there is no script to escape out of, but there is an argv to
+    smuggle a flag into: a "URL" of `--renderer-cmd-prefix=...` handed to
+    chrome.exe is a command. So only http(s) and file URLs are passed, and
+    they cannot begin with a dash.
     """
+    if _is_windows():
+        return await _open_browser_windows(url, browser)
     escaped_url = applescript_escape(url)
 
     if browser.lower() == "firefox":
@@ -159,13 +241,64 @@ async def open_browser(url: str, browser: str = "chrome") -> dict:
     }
 
 
+_WINDOWS_BROWSERS = {
+    "chrome": ("Chrome", "chrome", (r"Google\Chrome\Application\chrome.exe",)),
+    "firefox": ("Firefox", "firefox", (r"Mozilla Firefox\firefox.exe",)),
+}
+
+
+def _windows_browser(which: str) -> str | None:
+    """Where the named browser's executable is, or None."""
+    _label, exe, rel_paths = _WINDOWS_BROWSERS[which]
+    found = shutil.which(exe)
+    if found:
+        return found
+    roots = [os.environ.get(v) for v in
+             ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
+    for root in filter(None, roots):
+        for rel in rel_paths:
+            candidate = Path(root) / rel
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+_SAFE_URL = re.compile(r"^(https?://|file:///)", re.IGNORECASE)
+
+
+async def _open_browser_windows(url: str, browser: str) -> dict:
+    which = "firefox" if browser.lower() == "firefox" else "chrome"
+    app_name = _WINDOWS_BROWSERS[which][0]
+    if not _SAFE_URL.match(url or ""):
+        log.error(f"open_browser refused a non-web URL on Windows: {url[:80]!r}")
+        return {"success": False,
+                "confirmation": f"I won't hand that to {app_name}, sir."}
+    exe = _windows_browser(which)
+    if exe is None:
+        log.error(f"open_browser: {app_name} is not installed")
+        return {"success": False,
+                "confirmation": f"I can't find {app_name} on this machine, sir."}
+    success = await _spawn_detached([exe, url])
+    return {
+        "success": success,
+        "confirmation": f"Pulled that up in {app_name}, sir." if success
+        else f"{app_name} ran into a problem, sir.",
+    }
+
+
 # Keep backward compat
 async def open_chrome(url: str) -> dict:
     return await open_browser(url, "chrome")
 
 
 async def get_chrome_tab_info() -> dict:
-    """Read the current Chrome tab's title and URL via AppleScript."""
+    """Read the current Chrome tab's title and URL via AppleScript.
+
+    macOS only: Windows exposes no tab URL without a browser extension, so
+    there this is always {} — the same answer as "could not tell".
+    """
+    if _is_windows():
+        return {}
     script = (
         'tell application "Google Chrome"\n'
         "    set tabTitle to title of active tab of front window\n"
@@ -206,8 +339,34 @@ async def get_chrome_tab_info() -> dict:
 VSCODE_APP = "/Applications/Visual Studio Code.app"
 
 
+def _vscode_exe_windows() -> str | None:
+    """VS Code's own Code.exe on Windows, or None.
+
+    Never `code.cmd`: a batch file re-parses its arguments in cmd.exe, and a
+    file name may legally contain `&`. The shim sits in `<install>\bin`, so
+    Code.exe is one directory up from it; the two default install
+    locations are tried after that.
+    """
+    shim = shutil.which("code")
+    candidates = []
+    if shim:
+        candidates.append(Path(shim).resolve().parent.parent / "Code.exe")
+    for var, rel in (("LOCALAPPDATA", r"Programs\Microsoft VS Code\Code.exe"),
+                     ("PROGRAMFILES", r"Microsoft VS Code\Code.exe")):
+        root = os.environ.get(var)
+        if root:
+            candidates.append(Path(root) / rel)
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return None
+
+
 def _vscode_command(path: str) -> list[str] | None:
     """The argv that opens `path` in VS Code, or None if it is not installed."""
+    if _is_windows():
+        exe = _vscode_exe_windows()
+        return [exe, str(path)] if exe else None
     binary = shutil.which("code")
     if binary:
         return [binary, str(path)]
@@ -216,12 +375,37 @@ def _vscode_command(path: str) -> list[str] | None:
     return None
 
 
+def _system_editor_command(path: str) -> list[str]:
+    """The no-VS-Code fallback.
+
+    macOS `open` hands a file to its default app. Windows' equivalent
+    (`os.startfile`) RUNS a .bat, .ps1 or .exe, so it is never used: a
+    directory goes to Explorer and a file to Notepad, which can open
+    anything and execute nothing.
+    """
+    if not _is_windows():
+        return ["open", str(path)]
+    windir = os.environ.get("WINDIR") or r"C:\Windows"
+    if os.path.isdir(path):
+        return [str(Path(windir) / "explorer.exe"), str(path)]
+    return [str(Path(windir) / "System32" / "notepad.exe"), str(path)]
+
+
 async def open_in_editor(path: str) -> dict:
     """Open a file or directory in VS Code, else in the system default."""
     argv = _vscode_command(path)
+    if _is_windows():
+        editor = "VS Code" if argv else "your editor"
+        ok = await _spawn_detached(argv or _system_editor_command(path))
+        return {
+            "success": ok,
+            "editor": editor,
+            "confirmation": f"Opened that in {editor}, sir." if ok
+            else f"{editor} wouldn't open that, sir.",
+        }
     editor = "VS Code"
     if argv is None:
-        argv = ["open", str(path)]
+        argv = _system_editor_command(path)
         editor = "your editor"
 
     try:

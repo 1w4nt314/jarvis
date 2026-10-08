@@ -15,12 +15,11 @@ import asyncio
 import logging
 import math
 import os
-import shlex
-import shutil
 import time
 from typing import Callable
 
 import claude_env
+import platform_support
 import stream_parser
 
 log = logging.getLogger("jarvis.run_executor")
@@ -207,7 +206,7 @@ class RunExecutor:
                  idle_sec: float | None = None,
                  poll_sec: float = _READ_POLL_SEC):
         self._store = store
-        self._claude_path = claude_path or shutil.which("claude") or "claude"
+        self._claude_path = claude_path or platform_support.find_claude() or "claude"
         self._max_concurrent = max_concurrent
         self._grace_sec = grace_sec
         self._eof_grace_sec = eof_grace_sec
@@ -402,7 +401,12 @@ class RunExecutor:
         if proc.returncode is not None:
             return
         try:
-            proc.terminate()
+            if platform_support.IS_WINDOWS:
+                # No SIGTERM there: end the whole tree, or the run's own
+                # children outlive it. See platform_support.kill_tree.
+                await asyncio.to_thread(platform_support.kill_tree, proc.pid)
+            else:
+                proc.terminate()
         except (ProcessLookupError, OSError):
             pass
         try:
@@ -441,7 +445,10 @@ class RunExecutor:
 
     def _command(self, run_id: str, resume_from: str | None,
                 model: str | None = None) -> list[str]:
-        base = shlex.split(self._claude_path)
+        # Not shlex.split: on Windows that eats the backslashes out of a
+        # path, and an npm `claude.cmd` shim must be unwrapped rather than
+        # handed to cmd.exe. See platform_support.split_command.
+        base = platform_support.split_command(self._claude_path)
         cmd = base + ["-p", "--output-format", "stream-json", "--verbose",
                       "--session-id", run_id]
         if resume_from:

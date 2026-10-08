@@ -1,6 +1,6 @@
 ---
 name: jarvis-setup
-description: Use when helping someone install, configure, or debug a fresh clone of JARVIS (this repo) — especially "the mic doesn't work", "JARVIS says his language systems are down", any Firefox/browser question, login/auth failures, or Accessibility permission prompts. Carries facts about this project that were only learned by hitting them live; check it before guessing.
+description: Use when helping someone install, configure, or debug a fresh clone of JARVIS (this repo) on macOS or Windows — especially "the mic doesn't work", "JARVIS says his language systems are down", any Firefox/browser question, login/auth failures, Accessibility permission prompts, or a Windows setup. Carries facts about this project that were only learned by hitting them live; check it before guessing.
 ---
 
 # Setting up JARVIS
@@ -91,6 +91,32 @@ does not follow the app there. Move it to `/Applications` and relaunch.
 `preflight.py`'s `accessibility` check detects the failure (AppleScript
 error `-1728` / "not allowed assistive access") without ever triggering the
 permission prompt itself, and its remedy text carries this same guidance.
+
+## On Windows: no Accessibility, and a few different traps
+
+Unlike everything else in this file, this section was written from the code
+and the Win32 documentation, not learned live — treat it as the place to
+start looking, and correct it when a real Windows setup proves it wrong.
+
+- **There is no permission to grant.** `answer_dialog` writes the key into
+  the session's own console (`windows_native.press_key`, run as a helper
+  process), and screenshots are a GDI capture. `preflight.py` reports both
+  `accessibility` and `screen_recording` as OK on Windows for that reason. A
+  blank screenshot means a locked screen or a UAC prompt, not a permission.
+- **`answer_dialog` reaches console-hosted sessions only** — Windows
+  Terminal, PowerShell, cmd. A pid with no console comes back `no_tty`.
+- **"JARVIS won't talk" + `--reload`.** uvicorn's reloader uses an event loop
+  that cannot start subprocesses on Windows, so the brain never spawns.
+  `server.py` prints a warning; run it without `--reload`.
+- **`claude` found but the brain dies at once.** Check the log for the argv
+  it tried. An npm install's `claude.cmd` is unwrapped to `node cli.js` by
+  `platform_support.split_command`; if the shim's layout ever changes and
+  that fails, setting `JARVIS_CLAUDE_PATH` to the real `claude.exe` (native
+  installer: `%USERPROFILE%\.local\bin\claude.exe`) is the fix.
+- **Login check.** There is no Keychain on Windows: `preflight.py` reads the
+  refresh-token expiry from `<config dir>\.credentials.json` instead.
+- **Certificates.** Git for Windows ships `openssl.exe`; from Git Bash the
+  subject must be written `//CN=localhost` (Git Bash rewrites a leading `/`).
 
 ## `FISH_API_KEY` is genuinely required — there is no fallback voice
 

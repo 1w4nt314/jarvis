@@ -717,8 +717,10 @@ def terminal(monkeypatch):
     import actions
     opened: list[str] = []
 
-    async def fake_open_terminal(command=""):
-        opened.append(command)
+    async def fake_open_terminal(command="", cwd=None):
+        # Recorded as the shell text macOS would run, so a test reads the
+        # directory and the command together.
+        opened.append(actions._cd_then(cwd, command))
         return {"success": True, "confirmation": "Terminal is open, sir."}
 
     monkeypatch.setattr(actions, "open_terminal", fake_open_terminal)

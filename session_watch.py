@@ -19,6 +19,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import platform_support
+
 # Both roots must be read: the CLI's default and the one Orcha sets via
 # CLAUDE_CONFIG_DIR. On the dev machine `~/.claude/sessions` was empty and
 # every session lived under `~/.claude-orcha` — a plain-Terminal user is the
@@ -40,20 +42,14 @@ def config_roots() -> list[Path]:
 
 
 def pid_alive(pid) -> bool:
-    """True if the process exists. Signal 0 checks without touching it.
+    """True if the process exists. Never signals it.
 
-    `pid` must be a positive integer: 0 means "this process's group" and a
-    negative pid means "that group" to `os.kill`, neither of which is a real
-    process, so both are rejected before the syscall.
+    Delegates to `platform_support.pid_alive`: signal 0 on POSIX, and on
+    Windows a query handle — because there `os.kill(pid, 0)` is
+    TerminateProcess, and this runs once a second over every Claude Code
+    process on the machine.
     """
-    try:
-        pid = int(pid)
-        if pid <= 0:
-            return False
-        os.kill(pid, 0)
-    except (OSError, TypeError, ValueError):
-        return False
-    return True
+    return platform_support.pid_alive(pid)
 
 
 def encode_cwd(cwd: str) -> str:
@@ -97,12 +93,12 @@ class RosterEntry:
         Measured: 4 of 17 live entries had none. `ListAgents` cannot see those
         at all, which is why this watcher exists.
         """
-        return bool(self.socket_path) and Path(self.socket_path).exists()
+        return platform_support.ipc_endpoint_exists(self.socket_path)
 
 
 def _parse_entry(path: Path, root: Path) -> RosterEntry | None:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None            # unreadable, empty, or caught mid-write
     if not isinstance(data, dict):
@@ -656,10 +652,13 @@ def _same_dir(a: str, b: str) -> bool:
     the brain's home one way here and another way in the roster entry the
     process wrote, and the brain then appeared as one of the user's own
     conversations. `realpath` does not require the path to exist.
+    `normcase` makes the compare case-insensitive where the filesystem is
+    (Windows) and is a no-op everywhere else.
     """
     if not a or not b:
         return False
-    return os.path.realpath(a) == os.path.realpath(b)
+    return (os.path.normcase(os.path.realpath(a))
+            == os.path.normcase(os.path.realpath(b)))
 
 
 def _pick_primary(entries: list[RosterEntry]) -> RosterEntry:

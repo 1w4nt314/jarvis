@@ -495,7 +495,7 @@ def read_agent_meta(path: Path, cache: Cache) -> dict:
     if hit is not None:
         return hit
     try:
-        body = json.loads(side.read_text())
+        body = json.loads(side.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         body = {}
     if not isinstance(body, dict):

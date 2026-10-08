@@ -1,10 +1,15 @@
-"""Post a message into a running Claude Code session.
+r"""Post a message into a running Claude Code session.
 
-The wire format is one JSON line on the session's inbox Unix socket. It carries
-PEER authority, not the user's: the session receives it as a new turn (or
-queues it between tool calls if busy), but it cannot dismiss a permission
-prompt or a modal dialog. On this machine those are the two `waitingFor`
-reasons that actually occur, so the caller must check before promising a fix.
+The wire format is one JSON line on the session's inbox Unix socket — or,
+on Windows, its inbox named pipe (`\\.\pipe\...`): Node cannot listen on
+a socket file there, so that is what the roster names. The bytes are the
+same either way.
+
+It carries PEER authority, not the user's: the session receives it as a new
+turn (or queues it between tool calls if busy), but it cannot dismiss a
+permission prompt or a modal dialog. On this machine those are the two
+`waitingFor` reasons that actually occur, so the caller must check before
+promising a fix.
 """
 
 from __future__ import annotations
@@ -12,7 +17,8 @@ from __future__ import annotations
 import json
 import os
 import socket
-from pathlib import Path
+
+import platform_support
 
 SENT = "sent"          # the bytes left over the socket — NOT that the target
                         # session accepted or even received them; no reply is
@@ -31,7 +37,7 @@ def post_to_session(socket_path: str | None, prompt: str,
     """
     if not prompt or not prompt.strip():
         return REFUSED
-    if not socket_path or not Path(socket_path).exists():
+    if not platform_support.ipc_endpoint_exists(socket_path):
         return NOT_LIVE
 
     lines = []
@@ -53,6 +59,11 @@ def post_to_session(socket_path: str | None, prompt: str,
                              "message": {"role": "user", "content": prompt.strip()}}))
     payload = ("\n".join(lines) + "\n").encode()
 
+    if platform_support.is_named_pipe(socket_path):
+        return _post_to_pipe(socket_path, payload)
+    if not hasattr(socket, "AF_UNIX"):
+        return FAILED             # a socket file on a platform without them
+
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
@@ -70,4 +81,17 @@ def post_to_session(socket_path: str | None, prompt: str,
             sock.close()
         except OSError:
             pass
+    return SENT
+
+
+def _post_to_pipe(pipe_path: str, payload: bytes) -> str:
+    """The named-pipe half of `post_to_session`. A pipe is a file to Win32:
+    opening it connects, writing sends, closing hangs up."""
+    try:
+        with open(pipe_path, "wb", buffering=0) as pipe:
+            pipe.write(payload)
+    except FileNotFoundError:
+        return NOT_LIVE           # the session went away since the check
+    except OSError:
+        return FAILED
     return SENT

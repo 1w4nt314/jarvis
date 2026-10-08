@@ -57,8 +57,9 @@ class _Actions:
         return {"success": self.success, "editor": "VS Code",
                 "confirmation": "Opened, sir."}
 
-    async def open_terminal(self, command=""):
-        self.terminal.append(command)
+    async def open_terminal(self, command="", cwd=None):
+        import actions
+        self.terminal.append(actions._cd_then(cwd, command))
         return {"success": self.success, "confirmation": "Terminal's open, sir."}
 
     async def open_browser(self, url, browser="chrome"):

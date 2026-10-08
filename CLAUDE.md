@@ -1,7 +1,7 @@
 # JARVIS — Voice AI Assistant
 
 ## Overview
-JARVIS (Just A Rather Very Intelligent System) is a voice-first AI assistant for macOS. It runs locally on your machine, driving Claude Code for development tasks — every execution recorded as a *run* and watchable at `/dashboard`.
+JARVIS (Just A Rather Very Intelligent System) is a voice-first AI assistant for macOS and Windows. It runs locally on your machine, driving Claude Code for development tasks — every execution recorded as a *run* and watchable at `/dashboard`.
 
 ## Quick Start
 Read `skills/jarvis-setup/SKILL.md` first — it carries setup and debugging
@@ -27,6 +27,10 @@ When a user clones this repo and starts Claude Code, help them:
 10. Open Chrome (mic only works in Chrome) to http://localhost:5173
 11. Click to enable audio, speak to JARVIS
 
+On **Windows** the steps are the same; README.md's "Running on Windows" has
+the PowerShell spelling of each, the `openssl` that ships with Git for
+Windows for step 7, and why `--reload` must not be used there.
+
 **The certs are required for the dev-server workflow**, despite `server.py`
 treating them as optional. `server.py` serves HTTPS only when `cert.pem` and
 `key.pem` are both beside it, but `frontend/vite.config.ts` hard-codes its
@@ -43,7 +47,10 @@ this presents as "the UI is up but nothing works" rather than as an error.
 - **AI**: a long-lived Claude Code process (`brain.py`, Sonnet by default) on
   the user's subscription; no Anthropic API calls on the voice path
 - **TTS**: Fish Audio with JARVIS voice model
-- **System**: AppleScript for Terminal and Chrome integration
+- **System**: AppleScript for Terminal and Chrome integration on macOS;
+  Win32 through `ctypes` (`windows_native.py`) and Windows PowerShell on
+  Windows. Every platform difference is decided in `platform_support.py` or
+  behind a `sys.platform == "win32"` branch in the module that owns the job
 - **Runs**: every Claude Code execution goes through one recorded pipeline —
   `run_store.py` (SQLite) + `run_executor.py`, surfaced at `/api/runs`,
   `/ws/runs`, and the `/dashboard` UI
@@ -118,7 +125,16 @@ arbitrary LLM and file content, so everything goes through
   Accessibility, Fish key, cross-session steering
 - `claude_env.py` — The environment every spawned Claude Code child gets,
   including the `ANTHROPIC_*` scrub
-- `actions.py` — System actions (Terminal, Chrome) via AppleScript
+- `actions.py` — System actions (Terminal, Chrome, editor): AppleScript on
+  macOS, a new `cmd.exe` console / the browser's own executable on Windows
+- `platform_support.py` — What differs between macOS and Windows: starting
+  `claude` (an npm `claude.cmd` shim is unwrapped, never run through
+  `cmd.exe`), splitting a configured command without eating backslashes,
+  `pid_alive` (never `os.kill(pid, 0)` on Windows — it terminates the
+  process), named-pipe inboxes
+- `windows_native.py` — Win32 via `ctypes`, no dependencies: window list,
+  GDI screen capture + PNG encoding, and the `answer_dialog` helper that
+  writes one key into a session's own console (run as a separate process)
 - `browser.py` — Playwright. Only the headless half is live (`read_page`,
   `capture_page`, behind `read_page` / `look_at_page`); the headful
   `JarvisBrowser` search/research class is reachable from nothing but
@@ -210,7 +226,10 @@ needs the network, a real window, or a real `claude`, mark it.
   `/internal/tool`), not by parsing `[ACTION:X]` tags out of its reply — that
   tag machinery is gone in full, including the last handler (`_execute_browse`),
   which lost its caller with the voice dispatch chain
-- AppleScript for Terminal and Chrome control (no OAuth needed)
+- AppleScript for Terminal and Chrome control on macOS, Win32/PowerShell on
+  Windows (no OAuth needed either way). Never `os.startfile` on a file and
+  never spawn a `.cmd`/`.bat` with user-derived arguments on Windows — the
+  first executes it, the second re-parses its arguments in `cmd.exe`
 - SQLite for runs, run events and usage (`run_store.py`, `usage_store.py`);
   long-term memory is plain Markdown files instead (`jarvis_memory.py`) —
   the user edits it directly, so it is never a database

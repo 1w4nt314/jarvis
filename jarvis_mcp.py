@@ -20,6 +20,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# Where answer_dialog can reach differs by platform (see dialog.py): macOS
+# presses the key through Terminal.app and must bring it forward; Windows
+# writes it into the session's own console and moves no window at all.
+if sys.platform == "win32":
+    _DIALOG_REACH = (
+        "Works when that session is running in a console window (Windows "
+        "Terminal, PowerShell, cmd); a session hosted by another application "
+        "cannot be reached and the user is told so. No window is moved, but "
+        "only use it when the user has just asked for it.")
+else:
+    _DIALOG_REACH = (
+        "Only works when that session is running in Terminal.app; sessions "
+        "hosted by another application cannot be reached and the user is told "
+        "so. This BRINGS THAT WINDOW TO THE FRONT, so only use it when the user "
+        "has just asked for it.")
+
 PROTOCOL_VERSION = "2024-11-05"
 
 # How long this child waits for the server's answer to one tool call.
@@ -103,11 +119,7 @@ TOOL_SPECS = [
             "steer_session cannot do. The key must be one of: return (or yes), "
             "escape (or no), or a single digit 1-9 for a numbered option. Nothing "
             "else can be pressed and free text is refused, so ask which one the "
-            "user means rather than paraphrasing. Only works when that session is "
-            "running in Terminal.app; sessions hosted by another application "
-            "cannot be reached and the user is told so. This BRINGS THAT WINDOW "
-            "TO THE FRONT, so only use it when the user has just asked for it. "
-            "Returns as soon as the keypress is staged: JARVIS says what he is "
+            "user means rather than paraphrasing. " + _DIALOG_REACH + " Returns as soon as the keypress is staged: JARVIS says what he is "
             "about to press and presses it when your turn ends, unless the user "
             "stops him. Say briefly that it is going out, then end your turn — "
             "do not call this twice for the same keypress."),

@@ -29,14 +29,28 @@ would slot in at `find_terminal_tab`, but it is not installed here, so it is
 not claimed and not built. TIOCSTI — the host-independent way to do this — is
 refused by macOS 26.2 with PermissionError even on a pty the process owns;
 do not go looking for it again.
+
+**Windows** keeps all three rules and gets a better version of the first.
+There is no tty, but a console process is attached to exactly one console,
+and AttachConsole(pid) + WriteConsoleInput puts a key event into THAT
+console's input buffer — whatever window hosts it (conhost, Windows
+Terminal), with no focus change and nothing typed anywhere else. The
+"tty" is `console:<console window handle>`, read by attaching to the pid,
+and it is re-read at press time exactly as the Terminal script re-reads its
+tab's tty. Both steps run in a short-lived helper process
+(`windows_native.py`), because attaching to another console means detaching
+from your own. No Accessibility grant exists or is needed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 
 log = logging.getLogger("jarvis.dialog")
@@ -63,6 +77,12 @@ SEND_TIMEOUT = 20.0
 # session was up to twenty-five seconds of frozen microphone. This bounds
 # that until that caller can be made async (see `tty_for_pid_async`).
 _PS_TIMEOUT = 1.0
+
+# The Windows helper is a fresh Python interpreter, not `ps`: a cold start
+# (and a virus scanner looking at it) costs more than a second.
+_WIN_HELPER_TIMEOUT = 8.0
+_WIN_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "windows_native.py")
 
 # The closed vocabulary. `key code` numbers rather than `keystroke return`,
 # because a key code is unambiguous and cannot be reinterpreted as text.
@@ -134,6 +154,8 @@ def normalize_tty(tty: str | None) -> str | None:
     t = tty.strip()
     if not t or t == "??":
         return None
+    if re.fullmatch(r"console:[0-9]+", t):
+        return t                         # Windows: a console, by window handle
     if not t.startswith("/dev/"):
         t = "/dev/" + t
     # A device path and nothing else. Anything stranger is not a tty we will
@@ -154,8 +176,9 @@ def tty_for_pid(pid) -> str | None:
         return None
     if pid <= 0:
         return None
+    if sys.platform == "win32":
+        return _console_for_pid_windows(pid)
     try:
-        import subprocess
         out = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
                              capture_output=True, text=True,
                              timeout=_PS_TIMEOUT)
@@ -165,6 +188,27 @@ def tty_for_pid(pid) -> str | None:
     if out.returncode != 0:
         return None                      # ps exits non-zero for a dead pid
     return normalize_tty(out.stdout.strip())
+
+
+def _win_helper(*args: str) -> tuple[int, str]:
+    """Run `windows_native.py` with `args`; (returncode, stdout). Never raises."""
+    try:
+        out = subprocess.run(
+            [sys.executable, _WIN_HELPER, *args], capture_output=True, text=True,
+            timeout=_WIN_HELPER_TIMEOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        log.warning(f"windows console helper failed: {e}")
+        return -1, ""
+    return out.returncode, (out.stdout or "").strip()
+
+
+def _console_for_pid_windows(pid: int) -> str | None:
+    """`console:<handle>` for a live pid attached to a console, else None."""
+    rc, out = _win_helper("console", str(pid))
+    if rc != 0 or not out.isdigit():
+        return None
+    return normalize_tty(f"console:{out}")
 
 
 async def tty_for_pid_async(pid) -> str | None:
@@ -364,6 +408,8 @@ async def answer(pid: int, key: str) -> str:
         tty = await tty_for_pid_async(pid)
         if tty is None:
             return NO_TTY
+        if tty.startswith("console:"):
+            return await _answer_windows(pid, tty, normalized)
         tab = await find_terminal_tab(tty)
         if tab is None:
             # Another application hosts this tty. Press nothing.
@@ -390,3 +436,24 @@ async def answer(pid: int, key: str) -> str:
     except Exception as e:
         log.warning(f"answering a dialog for pid {pid} failed: {e}", exc_info=True)
         return FAILED
+
+
+async def _answer_windows(pid: int, tty: str, normalized: str) -> str:
+    """Press `normalized` in the console `pid` is attached to, if that
+    console is still `tty`. Same outcomes as the Terminal.app path."""
+    rc, out = await asyncio.to_thread(
+        _win_helper, "press", str(pid), normalized, tty.split(":", 1)[1])
+    if rc != 0:
+        log.warning(f"console key helper exited {rc}: {out!r}")
+        return FAILED
+    if out == "ok":
+        return SENT
+    if out in ("moved", "no_console"):
+        # The session's console changed or went away between the read-back
+        # and the press. Nothing was pressed.
+        log.warning(f"console for pid {pid} was {out} at press time")
+        return NOT_FOUND
+    if out == "bad_key":
+        return BAD_KEY
+    log.warning(f"unexpected console key helper result: {out!r}")
+    return FAILED

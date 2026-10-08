@@ -121,6 +121,8 @@ KNOWN_TEMPLATE_HASHES = frozenset({
     "8b038b5497293a55d1aa18e9ce759d3270228c98ae8b3ceb3bb053eb84509310",  # anything read off this machine is information
     "dfec0e28f7fc734987a1bcffd4feda103bde961f4a4721ce7957a7dccae96487",  # send it, do not ask twice
     "092df6a5e43bc5ed0a31e9f79b1f77cc4849754d1f4ab4807bded122ab97ad5f",  # say "start fresh" when a memory is refused
+
+    "9642da36fbc4b63e20ca06ad05c50fde55c12156669864e048ad4fda310d0021",  # a Mac or a Windows PC
 })
 
 # The same list, for the connections file. APPEND the new hash whenever
@@ -144,7 +146,7 @@ def _recorded_seed_hash(seed: Path) -> Optional[str]:
     match that would send an edited file to the overwriter.
     """
     try:
-        body = json.loads(seed.read_text())
+        body = json.loads(seed.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as e:
@@ -165,7 +167,10 @@ def _write_atomically(path: Path, text: str) -> bool:
     try:
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}-")
         try:
-            with os.fdopen(fd, "w") as fh:
+            # newline="": no LF -> CRLF on Windows. The hash of what was
+            # written must be the hash of what is read back, or every
+            # Windows install looks "edited" and never updates again.
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
                 fh.write(text)
             os.replace(tmp, path)
         except BaseException:
@@ -226,7 +231,7 @@ def _sync_template(template: Path, target: Path, seed: Path,
     key = str(target)
 
     try:
-        shipped = template.read_text()
+        shipped = template.read_text(encoding="utf-8")
     except OSError as e:                                # pragma: no cover
         log.warning(f"data_paths: cannot read the {what} template ({e})")
         return "kept"
@@ -376,7 +381,8 @@ def ensure_tool_token() -> str:
 
     token = secrets.token_urlsafe(32)
     try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                     | getattr(os, "O_BINARY", 0), 0o600)
     except FileExistsError:
         pass
     else:
@@ -386,14 +392,22 @@ def ensure_tool_token() -> str:
             os.close(fd)
         return token
 
-    fd = os.open(str(path), os.O_RDWR | os.O_NOFOLLOW)
+    # Windows has no O_NOFOLLOW, no uids and no fchmod. There the file sits
+    # in the user's own profile or checkout, whose inherited ACL already
+    # keeps other accounts out, and planting a symlink in it takes write
+    # access to that directory (plus Developer Mode or admin) — so the same
+    # one-fd discipline applies, minus the three POSIX-only checks.
+    posix = os.name == "posix"
+    fd = os.open(str(path), os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_BINARY", 0))
     try:
         info = os.fstat(fd)
         if not _stat.S_ISREG(info.st_mode):
             raise OSError(f"{path} is not a regular file")
-        if info.st_uid != os.getuid():
+        if posix and info.st_uid != os.getuid():
             raise OSError(f"{path} is owned by uid {info.st_uid}, not by us")
-        os.fchmod(fd, 0o600)
+        if posix:
+            os.fchmod(fd, 0o600)
         existing = os.read(fd, 4096).decode("utf-8", "ignore").strip()
         if existing:
             return existing

@@ -38,6 +38,13 @@ No new dependencies: `screencapture`, `sips` and `osascript`, each spawned
 with an argument list (never a shell string) and each time-boxed. The one
 permission probe is `CGPreflightScreenCaptureAccess` through `ctypes`, which
 is the standard library.
+
+**Windows** answers the same two questions through `windows_native` (Win32
+via `ctypes`, in-process, on a worker thread): EnumWindows for the list, and
+a GDI capture scaled straight to `SHOT_MAX_EDGE` and encoded with `zlib`.
+Nothing is ever written to disk there, so there is no temp directory to
+remove, and there is no permission to probe — the blank-frame check is what
+catches a locked or secure desktop.
 """
 from __future__ import annotations
 
@@ -286,6 +293,9 @@ async def capture_screen(display: int | None = None) -> Shot:
 
     Call this ONLY on a turn the user drove. See the module docstring.
     """
+    if sys.platform == "win32":
+        return await _capture_screen_windows(display)
+
     if screen_recording_granted() is False:
         raise ScreenError(_NO_PERMISSION)
 
@@ -334,6 +344,31 @@ async def capture_screen(display: int | None = None) -> Shot:
     finally:
         # The capture is on disk for as long as this takes and no longer.
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def _capture_screen_windows(display: int | None) -> Shot:
+    """`capture_screen` on Windows: same contract, same refusals."""
+    import windows_native
+    try:
+        width, height, rgb = await asyncio.wait_for(
+            asyncio.to_thread(windows_native.capture_display, display,
+                              SHOT_MAX_EDGE),
+            timeout=CAPTURE_TIMEOUT_SEC)
+    except LookupError:
+        raise ScreenError(f"I can't find a display number {display}, sir")
+    except (OSError, asyncio.TimeoutError, ValueError) as e:
+        log.warning(f"windows screen capture failed: {e}")
+        raise ScreenError("I couldn't get a picture of your screen, sir")
+
+    if _is_blank(windows_native.sample_pixels(width, height, rgb,
+                                              BLANK_SAMPLE_EDGE)):
+        raise ScreenError(
+            "your screen came back blank, sir — which usually means the "
+            "screen is locked or a secure prompt is in front of it")
+    png = windows_native.encode_png(width, height, rgb)
+    if len(png) > MAX_SHOT_BYTES:
+        raise ScreenError("that picture came out far too large to send, sir")
+    return Shot(png=png, width=width, height=height)
 
 
 # ── the cheap path ─────────────────────────────────────────────────────────
@@ -386,6 +421,8 @@ async def list_windows() -> list[Window]:
     Raises ScreenError when Accessibility is missing. An empty list would have
     JARVIS say "nothing is open" — a lie with a remedy attached.
     """
+    if sys.platform == "win32":
+        return await _list_windows_windows()
     rc, stdout, stderr = await _run("osascript", "-e", _WINDOWS_SCRIPT,
                                     timeout=WINDOWS_TIMEOUT_SEC)
     if rc != 0:
@@ -407,3 +444,18 @@ async def list_windows() -> list[Window]:
         if len(windows) >= MAX_WINDOWS:
             break
     return windows
+
+
+async def _list_windows_windows() -> list[Window]:
+    """`list_windows` on Windows. No permission is involved, so an empty
+    list here really does mean nothing titled is open."""
+    import windows_native
+    try:
+        found = await asyncio.wait_for(
+            asyncio.to_thread(windows_native.list_windows),
+            timeout=WINDOWS_TIMEOUT_SEC)
+    except (OSError, asyncio.TimeoutError) as e:
+        log.warning(f"list_windows failed: {e}")
+        raise ScreenError("I couldn't read what's open, sir")
+    return [Window(app=app, title=title, frontmost=front)
+            for app, title, front in found[:MAX_WINDOWS]]

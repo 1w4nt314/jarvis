@@ -189,3 +189,52 @@ async def test_long_text_is_truncated():
     assert sent_message != long_message
     assert sent_title.endswith("…")
     assert sent_message.endswith("…")
+
+
+# --- Windows: the same rule, by environment variable ----------------------
+#
+# PowerShell has no `on run argv`, so the toast script is fixed and the text
+# travels as environment variables (see notifier.py's module docstring).
+# `sys.platform` is stood in for; nothing here runs PowerShell.
+
+@pytest.fixture
+def on_windows(monkeypatch):
+    monkeypatch.setattr(notifier.sys, "platform", "win32")
+
+
+WINDOWS_INJECTION = "'; Remove-Item -Recurse C:\\ ; $(calc) `\" <xml/> & echo"
+
+
+@pytest.mark.asyncio
+async def test_windows_toast_text_travels_only_in_the_environment(monkeypatch,
+                                                                  on_windows):
+    monkeypatch.setattr(notifier, "_powershell", lambda: r"C:\WINDOWS\powershell.exe")
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return b"", b""
+
+    async def _spawn(*args, **kwargs):
+        captured["args"], captured["kwargs"] = args, kwargs
+        return _Proc()
+
+    monkeypatch.setattr(notifier.asyncio, "create_subprocess_exec", _spawn)
+    assert await notifier.notify(WINDOWS_INJECTION, WINDOWS_INJECTION, subtitle=WINDOWS_INJECTION) is True
+    joined = " ".join(captured["args"])
+    assert WINDOWS_INJECTION not in joined
+    assert WINDOWS_INJECTION not in notifier._WINDOWS_NOTIFY_SCRIPT
+    env = captured["kwargs"]["env"]
+    assert env["JARVIS_NOTIFY_TITLE"] == WINDOWS_INJECTION
+    assert env["JARVIS_NOTIFY_MESSAGE"] == WINDOWS_INJECTION
+    assert env["JARVIS_NOTIFY_SUBTITLE"] == WINDOWS_INJECTION
+    assert "-EncodedCommand" in captured["args"]
+
+
+def test_notifier_is_available_on_windows_with_powershell(monkeypatch, on_windows):
+    monkeypatch.setattr(notifier, "_powershell", lambda: r"C:\powershell.exe")
+    assert notifier.available() is True
+    monkeypatch.setattr(notifier, "_powershell", lambda: None)
+    assert notifier.available() is False

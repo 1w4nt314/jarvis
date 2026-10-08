@@ -13,8 +13,6 @@ import json
 import logging
 import os
 import re
-import shlex
-import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,6 +20,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 import claude_env
+import platform_support
 import usage_store
 
 log = logging.getLogger("jarvis.brain")
@@ -396,7 +395,7 @@ class _Turn:
 class Brain:
     def __init__(self, config: BrainConfig):
         self.config = config
-        self._claude = config.claude_path or shutil.which("claude") or "claude"
+        self._claude = config.claude_path or platform_support.find_claude() or "claude"
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader: Optional[asyncio.Task] = None
         self._turn_lock = asyncio.Lock()
@@ -742,7 +741,10 @@ class Brain:
 
     def command(self) -> list[str]:
         c = self.config
-        cmd = shlex.split(self._claude) + [
+        # split_command, not shlex.split: see platform_support — on Windows
+        # a `claude.cmd` shim would cut this multi-line system prompt at
+        # its first newline.
+        cmd = platform_support.split_command(self._claude) + [
             "-p", "--input-format", "stream-json", "--output-format", "stream-json",
             "--verbose", "--include-partial-messages",
             "--model", c.model, "--effort", c.effort, "--name", "jarvis",

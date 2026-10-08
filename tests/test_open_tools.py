@@ -38,8 +38,9 @@ class _Actions:
                 "confirmation": f"Pulled that up in {app}, sir."
                 if self.success else f"{app} ran into a problem, sir."}
 
-    async def open_terminal(self, command=""):
-        self.terminal.append(command)
+    async def open_terminal(self, command="", cwd=None):
+        import actions
+        self.terminal.append(actions._cd_then(cwd, command))
         return {"success": self.success,
                 "confirmation": "Terminal is open, sir."
                 if self.success else "I had trouble opening Terminal, sir."}

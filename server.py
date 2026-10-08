@@ -17,12 +17,27 @@ import os
 import difflib
 import re
 import secrets
-import shlex
 import sys
 import sqlite3
 import threading
 import time
 from pathlib import Path
+
+# Windows: Python's text files default to the ANSI code page there, and every
+# file JARVIS reads that it did not write — Claude Code's rosters and
+# transcripts, .env, memory Markdown — is UTF-8. Rather than trust every
+# `read_text()` in the codebase to say so, the server re-runs itself in
+# Python's UTF-8 mode (PYTHONUTF8 is inherited by the MCP child too). The
+# parent only waits: Ctrl+C reaches both, and the child shuts down cleanly.
+if __name__ == "__main__" and sys.platform == "win32" and not sys.flags.utf8_mode:
+    import subprocess as _subprocess
+    os.environ["PYTHONUTF8"] = "1"
+    _child = _subprocess.Popen([sys.executable, "-X", "utf8", *sys.argv])
+    while True:
+        try:
+            sys.exit(_child.wait())
+        except KeyboardInterrupt:
+            continue
 
 # The ONE definition of what a line of `.env` is. Both readers use it (this
 # boot loader and `_read_env`), and so does `_env_value_problem`, which is
@@ -50,7 +65,7 @@ def _parse_env_lines(text: str) -> list[tuple[str, str]]:
 # Load .env file if present
 _env_path = Path(__file__).parent / ".env"
 if _env_path.exists():
-    for _k, _v in _parse_env_lines(_env_path.read_text()):
+    for _k, _v in _parse_env_lines(_env_path.read_text(encoding="utf-8")):
         os.environ.setdefault(_k, _v)
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -3528,12 +3543,12 @@ async def _perform_command(item: _StagedCommand) -> None:
             await speech.say("Cancelled, sir.", Priority.NORMAL)
             return
 
-        # `cd` into the project first: a start command means nothing in the
-        # wrong directory, and the path is quoted while the command itself has
-        # already been through `builds.command_problem`, which permits no
-        # shell metacharacter at all.
-        result = await actions.open_terminal(
-            f"cd {shlex.quote(item.path)} && {item.command}")
+        # In the project directory: a start command means nothing in the
+        # wrong one. `actions` puts it there per platform (a quoted `cd` on
+        # macOS, the child's working directory on Windows), while the
+        # command itself has already been through `builds.command_problem`,
+        # which permits no shell metacharacter at all.
+        result = await actions.open_terminal(item.command, cwd=item.path)
         if result.get("success"):
             record("ran")
             await speech.say(
@@ -3644,7 +3659,7 @@ async def _perform_dialog(item: _StagedDialog) -> None:
                              Priority.NORMAL)
         elif outcome == dialog.NOT_FOUND:
             await speech.say(
-                f"{_said_name(item)} isn't in a Terminal window I can reach, "
+                f"{_said_name(item)} isn't in a terminal window I can reach, "
                 f"sir — another application is hosting it, so that one needs "
                 f"your own hand.", Priority.NORMAL)
         elif outcome == dialog.NOT_PERMITTED:
@@ -4861,7 +4876,7 @@ async def tool_open_in_terminal(args: dict) -> str:
     name, path, problem = _resolve_project_or_explain(reference)
     if problem:
         return problem
-    result = await actions.open_terminal(f"cd {shlex.quote(path)}")
+    result = await actions.open_terminal(cwd=path)
     if not result.get("success"):
         return result.get("confirmation") or "Terminal wouldn't open, sir."
     return f"Terminal's open in {name}, sir."
@@ -6542,7 +6557,7 @@ async def api_project_open(body: ProjectOpenRequest):
     if body.target == "editor":
         result = await actions.open_in_editor(body.path)
     elif body.target == "terminal":
-        result = await actions.open_terminal(f"cd {shlex.quote(body.path)}")
+        result = await actions.open_terminal(cwd=body.path)
     elif body.target == "browser":
         result = await actions.open_browser(Path(body.path).as_uri())
     else:
@@ -6998,6 +7013,16 @@ if __name__ == "__main__":
     # from `lifespan`, which runs whether the server was started by this
     # block or by `uvicorn server:app` — and it was the second of those that
     # never saw it.
+
+    if args.reload and sys.platform == "win32":
+        # uvicorn runs a reloader's worker on a SelectorEventLoop on Windows,
+        # and that loop cannot start subprocesses: the brain and every run
+        # would fail to spawn `claude`. Said here, at the one place it is
+        # chosen, rather than discovered as a mute JARVIS.
+        print("  WARNING: --reload on Windows cannot start Claude Code "
+              "(uvicorn's reload loop has no subprocess support). "
+              "Run without --reload.")
+        print()
 
     ssl_kwargs = {}
     if use_ssl:

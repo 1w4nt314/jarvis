@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 import claude_env
+import platform_support
 import screen
 
 log = logging.getLogger("jarvis.preflight")
@@ -135,7 +136,7 @@ def _parse_version(text: str) -> Optional[tuple[int, int, int]]:
 
 async def _check_claude_cli(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
     """`claude` is on PATH and is at least MIN_CLAUDE_VERSION."""
-    claude = shutil.which("claude")
+    claude = platform_support.find_claude()
     if not claude:
         return Check(
             name="claude_cli",
@@ -147,7 +148,8 @@ async def _check_claude_cli(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
             ),
         )
 
-    rc, stdout, stderr = await _run_subprocess(claude, "--version", timeout=timeout)
+    rc, stdout, stderr = await _run_subprocess(
+        *platform_support.split_command(claude), "--version", timeout=timeout)
     if rc != 0:
         return Check(
             name="claude_cli",
@@ -223,21 +225,35 @@ async def _read_oauth_refresh_expiry(config_dir: Path, timeout: float) -> Option
     signal available -- short of spending a real turn, which this module
     must not do.
 
+    Windows has no Keychain: the CLI keeps the same JSON object in
+    `<config dir>/.credentials.json` instead, so that file is read for the
+    same one field.
+
     Returns None -- "unknown", never "not expired" -- when the probe can't
-    be attempted or trusted: not macOS, `security` missing, no matching
-    keychain entry, or output that doesn't parse the way expected. Callers
-    must not treat None as a clean bill of health.
+    be attempted or trusted: `security` missing, no matching keychain entry
+    or credentials file, or output that doesn't parse the way expected.
+    Callers must not treat None as a clean bill of health.
     """
-    if sys.platform != "darwin" or not shutil.which("security"):
-        return None
-    service = _keychain_service_name(config_dir)
-    rc, stdout, _stderr = await _run_subprocess(
-        "security", "find-generic-password", "-s", service, "-w", timeout=timeout)
-    if rc != 0 or not stdout.strip():
+    if sys.platform == "darwin":
+        if not shutil.which("security"):
+            return None
+        service = _keychain_service_name(config_dir)
+        rc, stdout, _stderr = await _run_subprocess(
+            "security", "find-generic-password", "-s", service, "-w", timeout=timeout)
+        if rc != 0 or not stdout.strip():
+            return None
+    elif sys.platform == "win32":
+        try:
+            stdout = (config_dir / ".credentials.json").read_text(encoding="utf-8")
+        except OSError:
+            return None
+    else:
         return None
     try:
         data = json.loads(stdout)
     except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
         return None
     oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict):
@@ -270,7 +286,7 @@ async def _check_claude_login(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
     check stays OK (matching prior behaviour) but says so honestly rather
     than implying a guarantee it cannot make.
     """
-    claude = shutil.which("claude")
+    claude = platform_support.find_claude()
     if not claude:
         return Check(
             name="claude_login",
@@ -283,7 +299,9 @@ async def _check_claude_login(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
     config_dir = _config_dir_from_env(env)
     where = f"config dir: {config_dir}"
 
-    rc, stdout, stderr = await _run_subprocess(claude, "auth", "status", timeout=timeout, env=env)
+    rc, stdout, stderr = await _run_subprocess(
+        *platform_support.split_command(claude), "auth", "status",
+        timeout=timeout, env=env)
     if rc != 0:
         return Check(
             name="claude_login",
@@ -355,7 +373,16 @@ async def _check_accessibility(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
     returns AppleScript error -1728. If that ever stops being true on some
     macOS version, this comes back as a WARN (unrecognised error) rather
     than mis-reporting OK, so it fails safe.
+
+    Windows has no such grant to check: `answer_dialog` writes the key
+    straight into the session's own console input (see windows_native.py)
+    rather than synthesising a keystroke into whatever has focus.
     """
+    if sys.platform == "win32":
+        return Check(
+            name="accessibility", status=STATUS_OK,
+            message=("Windows needs no Accessibility grant: keys go straight into "
+                     "a session's own console."))
     if sys.platform != "darwin" or not shutil.which("osascript"):
         return Check(
             name="accessibility",
@@ -410,7 +437,13 @@ def _check_screen_recording_sync() -> Check:
     It asks CoreGraphics (`CGPreflightScreenCaptureAccess`, the non-prompting
     one) and NEVER captures anything to find out -- a screenshot the user did
     not ask for, at every boot, is precisely what this capability must not do.
+
+    Windows has no Screen Recording permission; a capture of a locked or
+    secure desktop comes back blank and `screen.capture_screen` refuses it.
     """
+    if sys.platform == "win32":
+        return Check(name="screen_recording", status=STATUS_OK,
+                     message="Windows needs no Screen Recording grant.")
     try:
         granted = screen.screen_recording_granted()
     except Exception as e:  # the module must never take startup down

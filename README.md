@@ -138,8 +138,11 @@ stuck is the CLI's own words, not a guess. Fictional sample data.*
 
 ## Requirements
 
-- **macOS.** Terminal control, window listing, screenshots and notifications
-  all go through AppleScript. There is no Linux or Windows path today.
+- **macOS or Windows 10/11.** On macOS, terminal control, window listing,
+  screenshots and notifications go through AppleScript; on Windows the same
+  jobs go through Win32 (via `ctypes`, no extra packages) and Windows
+  PowerShell — see [Running on Windows](#running-on-windows). There is no
+  Linux path today.
 - **Google Chrome.** Not a preference — a constraint. The microphone uses the
   Web Speech API (`SpeechRecognition` / `webkitSpeechRecognition`, see
   `frontend/src/voice.ts`), which Firefox has never implemented. There is no
@@ -222,6 +225,74 @@ One more thing about Chrome: the microphone permission is scoped to the
 grant does not follow, and Chrome will not re-prompt — it just stays denied,
 silently. If the mic stops working after everything else looks right, check
 that the port has not moved.
+
+### Running on Windows
+
+Everything above applies; only the commands and a few behaviours differ.
+The Windows path was written from the Win32 documentation and has not yet
+been through the live shakedown the macOS one has — if something below does
+not match what you see, the code it cites is where to look.
+
+**Setup, in PowerShell:**
+
+```powershell
+git clone <your fork of this repo> jarvis
+cd jarvis
+copy .env.example .env
+
+py -m pip install -r requirements.txt
+py -m playwright install chromium
+
+cd frontend; npm install; cd ..
+```
+
+Claude Code: either `npm install -g @anthropic-ai/claude-code` or the native
+installer (`irm https://claude.ai/install.ps1 | iex`), then run `claude`
+once and log in. Both work: an npm `claude.cmd` shim is never handed to
+`cmd.exe` (which would cut the brain's multi-line system prompt at its first
+newline) — `platform_support.split_command` reads the shim and runs `node
+cli.js` directly. If `claude` is somewhere unusual, set
+`JARVIS_CLAUDE_PATH` in `.env` to the full path.
+
+**Certificates.** Still required. Git for Windows ships `openssl`; from
+PowerShell:
+
+```powershell
+& "C:\Program Files\Git\usr\bin\openssl.exe" req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
+```
+
+(From Git Bash instead, write `-subj "//CN=localhost"` — Git Bash rewrites a
+leading `/` into a Windows path.)
+
+**Run it** in two terminals, exactly as on a Mac:
+
+```powershell
+py server.py --host 127.0.0.1        # terminal 1
+cd frontend; npm run dev             # terminal 2
+```
+
+`server.py` restarts itself once in Python's UTF-8 mode, because Claude
+Code's transcripts and your memory files are UTF-8 and Windows Python
+otherwise reads text in the ANSI code page. Do **not** use `--reload` on
+Windows: uvicorn's reloader runs on an event loop that cannot start
+subprocesses, so the brain would never start (the server warns you).
+
+**What is different on Windows:**
+
+| | macOS | Windows |
+|---|---|---|
+| `open_in_terminal`, `run_command` | Terminal.app, tinted blue | a new `cmd.exe` console titled "JARVIS" (a Windows Terminal tab if that is your default terminal) |
+| `answer_dialog` | key code through System Events into the Terminal.app tab that owns the session's tty — needs Accessibility, brings the window forward | the key is written into the session's **own console input** (AttachConsole + WriteConsoleInput): works for any console host — Windows Terminal, PowerShell, cmd — needs no permission and moves no window |
+| `what_is_on_screen` / `look_at_screen` | AppleScript window list, `screencapture` + `sips` — needs Screen Recording | EnumWindows, and a GDI capture scaled and PNG-encoded in-process — no permission exists; a locked screen comes back blank and is refused |
+| notifications | Notification Center via `osascript` | a toast via Windows PowerShell |
+| steering a session | its inbox Unix socket | its inbox named pipe |
+| opening in an editor | VS Code, else `open` | VS Code's `Code.exe`, else Explorer for a folder and Notepad for a file — never the file's default program, which for a `.bat` would run it |
+| reading the Chrome tab | AppleScript | not available |
+
+Two things were deliberately **not** carried over from the obvious Windows
+idioms, because each is a bug: `os.kill(pid, 0)` (on Windows it terminates
+the process — the session watcher would kill every Claude Code session it
+polled) and `os.startfile` for files (it executes them).
 
 ## Connections: bring your own
 
